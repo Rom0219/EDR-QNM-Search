@@ -2,33 +2,32 @@ import os
 import numpy as np
 import requests
 from gwpy.timeseries import TimeSeries
-from gwpy.signal.processing import whiten
+from gwpy.signal import filter_design
 from gwosc import datasets
 from scipy.signal import butter, filtfilt
 
 # =============================
-# CONFIGURACIÓN DE DIRECTORIOS
+# CONFIG DIRECTORIES
 # =============================
 RAW_DIR = "data/raw"
 CLEAN_DIR = "data/clean"
 PROC_DIR = "data/processed"
-FIG_DIR = "figures"
 
-for d in [RAW_DIR, CLEAN_DIR, PROC_DIR, FIG_DIR]:
+for d in [RAW_DIR, CLEAN_DIR, PROC_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # =============================
-# EVENTOS Y DETECTORES
+# EVENTOS LIGO
 # =============================
 EVENTS = [
     "GW150914", "GW151226", "GW170104", "GW170608", "GW170814",
     "GW170729", "GW190412", "GW190521", "GW190814", "GW200129"
 ]
 
-DETECTORS = ["H1", "L1", "V1"]
+DETECTORS = ["H1", "L1"]
 
 # =============================
-# A1 — Obtener GPS estable
+# A1 — GPS estable
 # =============================
 def get_gps(event):
     try:
@@ -43,99 +42,91 @@ def get_gps(event):
         return None
 
 # =============================
-# A2 — Descargar datos reales
+# A2 — Descargar datos
 # =============================
 def download_event(event, det, gps):
     try:
-        print(f"Descargando {event} ({det}) — GPS {gps}")
-
         urls = datasets.get_event_urls(event, detector=det)
-
-        if len(urls) == 0:
-            print(f"✖ No hay URLs disponibles para {event} [{det}]")
+        if not urls:
+            print(f"✖ No URLs for {event} [{det}]")
             return None
 
         url = urls[0]
-        print("URL:", url)
-
+        print(f"URL: {url}")
         ts = TimeSeries.read(url, format='hdf5')
 
         out = os.path.join(RAW_DIR, f"{event}_{det}_raw.hdf5")
         ts.name = f"{event}_{det}_raw"
         ts.write(out, path="/")
-
-        print(f"✔ Guardado en {out}")
+        print(f"✔ RAW saved: {out}")
         return out
-
     except Exception as e:
-        print(f"✖ Error descargando {event}/{det}: {e}")
+        print(f"✖ Error: {e}")
         return None
 
 # =============================
-# A3 — Highpass con Butterworth
+# A3 — Highpass filter
 # =============================
 def butter_highpass(data, fs, cutoff=30, order=4):
-    nyq = 0.5 * fs
+    nyq = fs * 0.5
     norm = cutoff / nyq
-    b, a = butter(order, norm, btype='high', analog=False)
+    b, a = butter(order, norm, btype="high")
     return filtfilt(b, a, data)
 
 # =============================
-# A4 + A5 — Preprocesamiento y Whitening
+# A4 — Whitening manual
+# =============================
+def whiten_manual(ts, fftlength=4):
+    psd = ts.psd(fftlength)
+    psd_interp = psd.interpolate(ts.frequencies)
+    white = ts / np.sqrt(psd_interp)
+    return white
+
+# =============================
+# A5 — Procesamiento completo
 # =============================
 def process_event(event, det):
-    print(f"\n===============================")
-    print(f"   PROCESANDO {event} — {det}")
-    print(f"===============================\n")
+    print(f"\n=============== {event} — {det} ===============")
 
     gps = get_gps(event)
     if gps is None:
-        print(f"✖ No se pudo obtener GPS de {event}")
         return
 
     raw_path = download_event(event, det, gps)
     if raw_path is None:
         return
 
-    ts_raw = TimeSeries.read(raw_path, format='hdf5')
-    fs = int(ts_raw.sample_rate.value)
-    t = ts_raw.times.value
+    ts_raw = TimeSeries.read(raw_path, format="hdf5")
+    fs = ts_raw.sample_rate.value
     data = ts_raw.value
+    t = ts_raw.times.value
 
-    # ---------- A3: filtro highpass ----------
-    hp = butter_highpass(data, fs, cutoff=30)
+    # Filtrado
+    hp = butter_highpass(data, fs)
     ts_hp = TimeSeries(hp, times=t)
-
     ts_hp.name = f"{event}_{det}_clean"
     clean_path = os.path.join(CLEAN_DIR, f"{event}_{det}_clean.hdf5")
     ts_hp.write(clean_path, path="/")
-    print(f"✔ Guardado archivo CLEAN: {clean_path}")
 
-    # ---------- A4: whitening ----------
-    ts_white = whiten(ts_hp)
+    # Whitening manual
+    ts_white = whiten_manual(ts_hp)
     ts_white.name = f"{event}_{det}_processed"
     proc_path = os.path.join(PROC_DIR, f"{event}_{det}_processed.hdf5")
     ts_white.write(proc_path, path="/")
-    print(f"✔ Guardado archivo PROCESSED: {proc_path}")
+
+    print(f"✔ CLEAN: {clean_path}")
+    print(f"✔ PROCESSED: {proc_path}")
 
 # =============================
-# MÓDULO A COMPLETO
+# RUN
 # =============================
 def run_pipeline():
-    print("\n============================================")
-    print("        EJECUTANDO PIPELINE COMPLETO")
-    print("============================================\n")
-
+    print("\n==== PIPELINE MÓDULO A ====\n")
     for event in EVENTS:
-        print(f"\n========== EVENTO: {event} ==========\n")
-
+        print(f"\n>>> EVENTO: {event} <<<")
         for det in DETECTORS:
-            print("\n--- (A1, A2, A3, A4, A5) Procesando datos ---\n")
             process_event(event, det)
-
-    print("\n============================================")
-    print("   PIPELINE MÓDULO A COMPLETO")
-    print("============================================\n")
+    print("\n==== COMPLETADO ====\n")
 
 if __name__ == "__main__":
     run_pipeline()
