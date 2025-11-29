@@ -1,36 +1,48 @@
 import os
 import requests
 from gwpy.timeseries import TimeSeries
-from gwosc.datasets import event_dataset
+from gwosc.datasets import event_gps
 
 RAW_DIR = "data/raw"
 os.makedirs(RAW_DIR, exist_ok=True)
 
-# ---------------------------------------------------
-# Obtener URL del strain LOSC real para un evento
-# ---------------------------------------------------
-def get_strain_url(event, detector):
-    """
-    Retorna la URL HDF5 oficial de strain para un detector.
-    Ejemplo:
-    detector = "H1" o "L1"
-    """
-    try:
-        urls = event_dataset(event)
-    except Exception as e:
-        raise ValueError(f"No se pudo obtener dataset para {event}: {e}")
-
-    # Buscar archivo LOSC del detector
-    for url in urls:
-        if f"-{detector}_LOSC" in url and url.endswith(".hdf5"):
-            return url
-
-    raise ValueError(f"No existe strain LOSC para {event}/{detector}")
+# -----------------------------------------
+# Detectar el RUN al que pertenece el evento
+# -----------------------------------------
+def detect_run(event):
+    if event.startswith("GW15"):
+        return "O1"
+    if event.startswith("GW16") or event.startswith("GW17"):
+        return "O2"
+    if event.startswith("GW19") or event.startswith("GW20"):
+        return "O3"
+    return "O3"
 
 
-# ---------------------------------------------------
-# Descargar archivo HDF5
-# ---------------------------------------------------
+# -----------------------------------------
+# Construir la URL del strain LOSC
+# -----------------------------------------
+def make_losc_url(event, detector):
+    gps = event_gps(event)
+    run = detect_run(event)
+
+    if detector not in ["H1", "L1"]:
+        raise ValueError("Detector inválido")
+
+    # IFO = primera letra: H / L
+    ifo = detector[0]
+
+    url = (
+        f"https://www.gw-openscience.org/archive/data/{run}/strain/"
+        f"{ifo}-{detector}_LOSC_4_V1-{int(gps)}-4096.hdf5"
+    )
+
+    return url
+
+
+# -----------------------------------------
+# Descargar strain
+# -----------------------------------------
 def download_strain(event, detector):
     out_path = f"{RAW_DIR}/{event}_{detector}.hdf5"
 
@@ -39,12 +51,12 @@ def download_strain(event, detector):
         return out_path
 
     try:
-        url = get_strain_url(event, detector)
+        url = make_losc_url(event, detector)
     except Exception as e:
-        print(f"✖ Error: {e}")
+        print(f"✖ Error construyendo URL: {e}")
         return None
 
-    print(f"Descargando archivo LOSC:\n{url}")
+    print(f"Descargando LOSC:\n{url}")
 
     resp = requests.get(url, stream=True)
     if resp.status_code != 200:
@@ -56,18 +68,17 @@ def download_strain(event, detector):
             if chunk:
                 f.write(chunk)
 
-    print(f"✓ Guardado en {out_path}")
+    print(f"✓ Archivo guardado en {out_path}")
     return out_path
 
 
-# ---------------------------------------------------
-# Cargar TimeSeries desde HDF5
-# ---------------------------------------------------
+# -----------------------------------------
+# Cargar strain en TimeSeries
+# -----------------------------------------
 def load_strain(path):
     try:
         ts = TimeSeries.read(path, format="hdf5.gwosc")
-        print(f"✓ Señal cargada ({len(ts)} muestras)")
         return ts
     except Exception as e:
-        print(f"✖ Error leyendo {path}: {e}")
+        print(f"✖ Error cargando {path}: {e}")
         return None
