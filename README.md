@@ -1,4 +1,8 @@
-#EDR-QNM-Search
+# Teoría del Espacio Dinámico Rotacional (EDR)
+Validación Numérica Oficial  
+Autor: **Camilo Robinson**
+
+# EDR-QNM-Search
 
 Búsqueda directa de desviaciones QNM (Ringdown) de la Teoría EDR en datos reales de LIGO/Virgo.
 
