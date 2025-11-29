@@ -1,15 +1,23 @@
 {
-    "name": "EDR-QNM-Search",
-    "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "name": "EDR-QNM-Search",
+  "image": "mcr.microsoft.com/devcontainers/python:0-3.10",
 
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "ms-python.python",
-                "ms-python.vscode-pylance"
-            ]
-        }
-    },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
 
-    "postCreateCommand": "pip install --upgrade pip && pip install 'gwpy[complete]' numpy scipy matplotlib h5py requests"
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python3.10"
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  },
+
+  "postCreateCommand": "pip install --upgrade pip && pip install numpy scipy matplotlib gwpy h5py requests pandas"
 }
