@@ -19,5 +19,5 @@
     }
   },
 
-  "postCreateCommand": "pip install --upgrade pip && pip install numpy scipy matplotlib gwpy h5py requests pandas"
+  "postCreateCommand": "pip install --upgrade pip && pip install numpy scipy matplotlib gwosc==0.5.4 gwpy==2.1.3 h5py requests"
 }
