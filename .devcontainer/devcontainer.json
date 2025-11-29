@@ -1,26 +1,19 @@
 {
-    "name": "EDR-LIGO-Analysis",
-    "image": "mcr.microsoft.com/devcontainers/python:3.10",
+    "name": "EDR-QNM-Search",
+    "image": "mcr.microsoft.com/devcontainers/python:3.11",
 
     "customizations": {
         "vscode": {
             "extensions": [
                 "ms-python.python",
-                "ms-toolsai.jupyter",
-                "ms-python.vscode-pylance",
-                "ms-toolsai.jupyter-renderers",
-                "ms-toolsai.jupyter-keymap"
+                "ms-python.vscode-pylance"
             ]
         }
     },
 
-    "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt",
-
-    "settings": {
-        "python.defaultInterpreterPath": "/usr/local/bin/python3",
-        "python.analysis.autoImportCompletions": true,
-        "python.analysis.useLibraryCodeForTypes": true
+    "features": {
+        "ghcr.io/devcontainers-contrib/features/git:1": {}
     },
 
-    "remoteUser": "vscode"
+    "postCreateCommand": "pip install --upgrade pip && pip install 'gwpy[complete]' numpy scipy matplotlib h5py requests"
 }
