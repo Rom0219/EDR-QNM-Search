@@ -38,6 +38,13 @@ def load_events_metadata(json_path="events.json"):
 # Cargar archivo blanco HDF5 (MANUAL)
 # =============================================
 def load_white_strain(event, det):
+    """
+    Carga el archivo whitened generado por run_pipeline
+    y reconstruye un objeto simple con:
+      - value: numpy array
+      - fs: frecuencia de muestreo
+      - times: tiempo relativo (0 -> duración)
+    """
     fname = f"data/white/{event}_{det}_white.hdf5"
     if not os.path.exists(fname):
         raise FileNotFoundError(fname)
@@ -46,14 +53,15 @@ def load_white_strain(event, det):
         data = f["strain"][:]
         fs = float(f["strain"].attrs["fs"])
 
-    # reconstruimos un "pseudo" TimeSeries:
-    class Obj:
+    # Objeto ligero tipo TimeSeries
+    class TS:
         pass
 
-    ts = Obj()
+    ts = TS()
     ts.value = data
     ts.fs = fs
-    ts.times = np.arange(len(data)) / fs + 0  # GPS relativo fake
+    # tiempo relativo del segmento (0 a T)
+    ts.times = np.arange(len(data)) / fs
 
     return ts
 
@@ -62,13 +70,22 @@ def load_white_strain(event, det):
 # Señal modelo para QNM
 # =============================================
 def damped_sinusoid(t, A, f, tau, phi):
-    return A * np.exp(-t/tau) * np.cos(2*np.pi*f*t + phi)
+    """
+    h(t) = A exp(-t/tau) cos(2π f t + phi)
+    """
+    return A * np.exp(-t / tau) * np.cos(2 * np.pi * f * t + phi)
 
 
 # =============================================
 # Estimar parámetros iniciales
 # =============================================
 def estimate_initial_params(t, h):
+    """
+    A partir de un segmento de ringdown:
+      - usa ventana Tukey
+      - FFT para estimar frecuencia dominante
+      - ajuste log-lineal del envolvente para tau
+    """
     win = tukey(len(h), 0.2)
     h_win = h * win
 
@@ -79,13 +96,13 @@ def estimate_initial_params(t, h):
     # buscar pico 100–3000 Hz
     band = (freqs >= 100) & (freqs <= 3000)
     if not np.any(band):
-        f0 = 1500
+        f0 = 1500.0
     else:
-        f0 = freqs[band][np.argmax(H[band])]
+        f0 = float(freqs[band][np.argmax(H[band])])
 
     env = np.abs(h)
     env = np.where(env <= 1e-24, 1e-24, env)
-    mask = env > 0.1*env.max()
+    mask = env > 0.1 * env.max()
 
     if np.sum(mask) < 10:
         tau0 = 0.01
@@ -93,23 +110,37 @@ def estimate_initial_params(t, h):
         t_sel = t[mask]
         e_sel = env[mask]
         a, b = np.polyfit(t_sel, np.log(e_sel), 1)
-        tau0 = -1/b if b < 0 else 0.01
+        tau0 = float(-1.0 / b) if b < 0 else 0.01
 
-    return float(env.max()), float(f0), float(tau0), 0.0
+    A0 = float(env.max())
+    phi0 = 0.0
+
+    return A0, f0, tau0, phi0
 
 
 # =============================================
-# Ajuste de QNM
+# Ajuste de QNM usando tiempo RELATIVO (no GPS)
 # =============================================
-def fit_qnm(ts, gps):
+def fit_qnm(ts):
+    """
+    Ajusta un QNM sobre el ringdown usando el segmento whitened:
+
+    - t va de 0 a T (∼8 s), igual que lo que guardamos en HDF5.
+    - El merger está aproximadamente en el centro del segmento.
+    - Buscamos el pico en una ventana alrededor de t_mid.
+    """
     fs = ts.fs
-    t_abs = ts.times
     h = ts.value
+    t = ts.times  # 0 → duración
 
-    t = t_abs - gps
+    # Duración total y centro del segmento (donde está el merger)
+    dur = float(t[-1] - t[0])
+    t_mid = t[0] + dur / 2.0
 
-    # buscar pico más flexible
-    def peak_search(t, h, tmin, tmax):
+    # Búsqueda flexible del pico alrededor de t_mid
+    def peak_search(t, h, t_center, half_width):
+        tmin = t_center - half_width
+        tmax = t_center + half_width
         mask = (t >= tmin) & (t <= tmax)
         if np.sum(mask) < 10:
             return None, None, None
@@ -118,47 +149,55 @@ def fit_qnm(ts, gps):
         idx = np.argmax(np.abs(hh))
         return tt[idx], tt, hh
 
-    # ampliamos mucho el rango del merger
+    t_peak = None
+    ts_seg = None
+    hs_seg = None
+
+    # probamos ventanas crecientes (±50, ±100, ±200 ms)
     for w in [0.05, 0.10, 0.20]:
-        t_peak, ts_seg, hs_seg = peak_search(t, h, -w, w)
+        t_peak, ts_seg, hs_seg = peak_search(t, h, t_mid, w)
         if t_peak is not None:
             break
 
     if t_peak is None:
         raise RuntimeError("No se pudo localizar un pico claro de ringdown.")
 
-    # ventana ringdown 100 ms
-    T_fit = 0.10
-    mask = (t >= t_peak) & (t <= t_peak + T_fit)
-    if np.sum(mask) < 30:
+    # Ventana de ringdown después del pico (ej. 150 ms)
+    T_fit = 0.15
+    mask_fit = (t >= t_peak) & (t <= t_peak + T_fit)
+    if np.sum(mask_fit) < 30:
         raise RuntimeError("Ringdown demasiado corto.")
 
-    t_fit = t[mask]
-    h_fit = h[mask]
+    t_fit = t[mask_fit]
+    h_fit = h[mask_fit]
 
-    # t relativo al inicio
+    # t relativo al inicio del ringdown
     t_fit = t_fit - t_fit[0]
 
-    # iniciales
+    # Parámetros iniciales
     A0, f0, tau0, phi0 = estimate_initial_params(t_fit, h_fit)
 
     p0 = [A0, f0, tau0, phi0]
     bounds = (
-        [0, 100, 1e-4, -2*np.pi],
-        [A0*20, 5000, 1.0, 2*np.pi]
+        [0.0, 100.0, 1e-4, -2.0 * np.pi],
+        [A0 * 20.0, 5000.0, 1.0, 2.0 * np.pi],
     )
 
     popt, _ = curve_fit(
-        damped_sinusoid, t_fit, h_fit,
-        p0=p0, bounds=bounds, maxfev=20000
+        damped_sinusoid,
+        t_fit,
+        h_fit,
+        p0=p0,
+        bounds=bounds,
+        maxfev=20000,
     )
 
     A, f, tau, phi = popt
     model = damped_sinusoid(t_fit, *popt)
     resid = h_fit - model
-    chi2 = float(np.mean(resid**2))
+    chi2 = float(np.mean(resid ** 2))
 
-    return f, tau, chi2
+    return float(f), float(tau), chi2
 
 
 # =============================================
@@ -178,10 +217,9 @@ def main():
         print(f"\n>>> EVENTO: {ev} (GPS = {gps:.3f})")
 
         for det in DETECTORS:
-
             try:
                 ts = load_white_strain(ev, det)
-                f, tau, chi2 = fit_qnm(ts, gps)
+                f, tau, chi2 = fit_qnm(ts)
                 ok = True
                 msg = "OK"
             except Exception as e:
@@ -189,21 +227,29 @@ def main():
                 ok = False
                 msg = str(e)
 
-            print(f"{ev:9s} {det:3s} "
-                  f"{(f if ok else 'nan'):>10} "
-                  f"{(tau if ok else 'nan'):>10} "
-                  f"{(chi2 if ok else 'nan'):>10} "
-                  f"{'YES' if ok else 'NO '} {msg}")
+            f_str = f"{f:10.2f}" if ok else "       nan"
+            tau_str = f"{tau:10.4f}" if ok else "       nan"
+            chi2_str = f"{chi2:10.3e}" if ok else "       nan"
 
-            results.append({
-                "event": ev,
-                "det": det,
-                "f_qnm": float(f) if ok else None,
-                "tau": float(tau) if ok else None,
-                "chi2": float(chi2) if ok else None,
-                "ok": ok,
-                "message": msg
-            })
+            print(
+                f"{ev:9s} {det:3s} "
+                f"{f_str} "
+                f"{tau_str} "
+                f"{chi2_str} "
+                f"{'YES' if ok else 'NO '} {msg}"
+            )
+
+            results.append(
+                {
+                    "event": ev,
+                    "det": det,
+                    "f_qnm": float(f) if ok else None,
+                    "tau": float(tau) if ok else None,
+                    "chi2": float(chi2) if ok else None,
+                    "ok": ok,
+                    "message": msg,
+                }
+            )
 
     # guardar JSON
     os.makedirs("results", exist_ok=True)
