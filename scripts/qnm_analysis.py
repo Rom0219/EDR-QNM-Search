@@ -1,142 +1,203 @@
 import os
-import json
+import h5py
 import numpy as np
+from dataclasses import dataclass
 from scipy.optimize import curve_fit
-from gwpy.timeseries import TimeSeries
 
-WHITE_PATH = "data/white"
-REPORTS_DIR = "reports"
-os.makedirs(REPORTS_DIR, exist_ok=True)
+# ======================================================
+# 1) Estructura para guardar resultados
+# ======================================================
 
-# misma lista de eventos que en run_pipeline.py
-EVENTS = {
-    "GW150914":   {"gps": 1126259462, "run": "O1"},
-    "GW151226":   {"gps": 1135136350, "run": "O1"},
-    "GW170104":   {"gps": 1167559936, "run": "O2"},
-    "GW170608":   {"gps": 1180922494, "run": "O2"},
-    "GW170814":   {"gps": 1186741861, "run": "O2"},
-    "GW170729":   {"gps": 1185389807, "run": "O2"},
-    "GW170823":   {"gps": 1187529256, "run": "O2"},
-    "GW190412":   {"gps": 1239082262, "run": "O3"},
-    "GW190521":   {"gps": 1242442967, "run": "O3"},
-    "GW190814":   {"gps": 1249852257, "run": "O3"},
-}
-
-DET_LIST = ["H1", "L1"]
+@dataclass
+class QNMResult:
+    event: str
+    detector: str
+    f_qnm: float        # frecuencia [Hz]
+    tau: float          # tiempo de decaimiento [s]
+    A: float            # amplitud
+    phi: float          # fase [rad]
+    t0: float           # inicio de ringdown [s]
+    success: bool
+    message: str
 
 
-# -----------------------------
-# Modelo: seno amortiguado
-# -----------------------------
-def damped_sine(t, A, f, tau, phi, C):
-    return A * np.exp(-(t - t[0]) / tau) * np.sin(2 * np.pi * f * (t - t[0]) + phi) + C
+# ======================================================
+# 2) Utilidades de carga
+# ======================================================
 
-
-def fit_qnm(ts, t0_offset=0.01, t_window=0.2):
+def load_white_timeseries(event_name: str, detector: str,
+                          base_dir: str = "data/white",
+                          t_pre: float = 4.0):
     """
-    t0_offset: segundos después del máximo para empezar el ringdown.
-    t_window: duración de la ventana de ajuste (segundos).
+    Carga el strain blanqueado desde HDF5 y construye el eje de tiempo
+    relativo al evento (t=0 en el GPS del catálogo).
+    Asumimos que el archivo se generó con una ventana [gps-4, gps+4].
     """
-    # tomar datos como arrays
-    t = ts.times.value
-    y = ts.value
+    fname = os.path.join(base_dir, f"{event_name}_{detector}_white.hdf5")
+    if not os.path.exists(fname):
+        raise FileNotFoundError(f"No existe archivo WHITE: {fname}")
 
-    # tomar máximo (amplitud) como referencia
-    imax = np.argmax(np.abs(y))
-    t0 = t[imax] + t0_offset
-    t1 = t0 + t_window
+    with h5py.File(fname, "r") as f:
+        data = f["strain"][:]
+        fs = float(f["strain"].attrs["fs"])
 
-    # recortar ventana
-    mask = (t >= t0) & (t <= t1)
-    t_win = t[mask]
-    y_win = y[mask]
+    n = len(data)
+    dt = 1.0 / fs
+    # Tiempo relativo: empieza en -t_pre y termina en -t_pre + n*dt
+    t = np.arange(n) * dt - t_pre
 
-    if len(t_win) < 10:
-        raise RuntimeError("Ventana de ringdown demasiado corta para ajuste")
-
-    # estimaciones iniciales:
-    dt = np.median(np.diff(t_win))
-    fs = 1.0 / dt
-
-    # frecuencia estimada vía FFT rápida
-    yf = np.fft.rfft(y_win)
-    xf = np.fft.rfftfreq(len(y_win), dt)
-    f_guess = xf[np.argmax(np.abs(yf))]
-
-    A_guess = np.max(np.abs(y_win))
-    tau_guess = 0.05  # 50 ms
-    phi_guess = 0.0
-    C_guess = 0.0
-
-    p0 = [A_guess, f_guess, tau_guess, phi_guess, C_guess]
-
-    popt, pcov = curve_fit(damped_sine, t_win, y_win, p0=p0, maxfev=10000)
-
-    A, f, tau, phi, C = popt
-    # errores (desviaciones estándar aprox.)
-    perr = np.sqrt(np.diag(pcov))
-    A_err, f_err, tau_err, phi_err, C_err = perr
-
-    Q = np.pi * f * tau  # factor de calidad aproximado
-
-    return {
-        "t0_ringdown": float(t0),
-        "A": float(A),
-        "A_err": float(A_err),
-        "f_Hz": float(f),
-        "f_err_Hz": float(f_err),
-        "tau_s": float(tau),
-        "tau_err_s": float(tau_err),
-        "Q": float(Q),
-        "phi_rad": float(phi),
-        "phi_err_rad": float(phi_err),
-        "C": float(C),
-        "C_err": float(C_err),
-        "n_points": int(len(t_win)),
-        "dt_s": float(dt),
-    }
+    return t, data, fs
 
 
-def analyze_all_events():
-    results = {}
+# ======================================================
+# 3) Ringdown: recorte de ventana
+# ======================================================
 
-    for ev_name in EVENTS.keys():
-        for det in DET_LIST:
-            key = f"{ev_name}_{det}"
-            fname = os.path.join(WHITE_PATH, f"{ev_name}_{det}_white.hdf5")
+def select_ringdown_window(t, h,
+                           t_start: float = 0.01,
+                           t_end: float = 0.30):
+    """
+    Selecciona sólo el pedazo de señal donde esperamos el ringdown.
+    Por defecto: entre 0.01 s y 0.30 s después del merger (t=0).
+    """
+    mask = (t >= t_start) & (t <= t_end)
+    t_rd = t[mask]
+    h_rd = h[mask]
 
-            print(f"\n>>> Analizando QNM: {ev_name} / {det}")
+    if len(t_rd) < 10:
+        raise ValueError("Muy pocos puntos en la ventana de ringdown.")
 
-            if not os.path.exists(fname):
-                print("✖ No existe archivo blanqueado:", fname)
-                continue
-
-            try:
-                ts = TimeSeries.read(fname, format="hdf5")
-            except Exception as e:
-                print("✖ Error leyendo:", e)
-                continue
-
-            try:
-                qnm = fit_qnm(ts)
-                print("✔ f_QNM ≈ {:.1f} Hz, tau ≈ {:.4f} s, Q ≈ {:.1f}".format(
-                    qnm["f_Hz"], qnm["tau_s"], qnm["Q"]
-                ))
-                results[key] = qnm
-            except Exception as e:
-                print("✖ Error ajustando QNM:", e)
-                continue
-
-    # Guardar reporte JSON
-    out_json = os.path.join(REPORTS_DIR, "EDR_QNM_fit_results.json")
-    with open(out_json, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("\n====================================")
-    print("  REPORTE QNM GUARDADO EN:")
-    print(" ", out_json)
-    print("====================================")
+    # Recentramos t para que el fit vea t=0 al inicio del ringdown
+    t0 = t_rd[0]
+    return t_rd - t0, h_rd, t0
 
 
-if __name__ == "__main__":
-    analyze_all_events()
+# ======================================================
+# 4) Modelo de seno amortiguado y ajustes
+# ======================================================
+
+def damped_sinusoid(t, A, f, tau, phi):
+    """
+    h(t) = A * exp(-t/tau) * cos(2π f t + phi)
+    """
+    return A * np.exp(-t / tau) * np.cos(2 * np.pi * f * t + phi)
+
+
+def estimate_initial_frequency(t, h, fmin=50.0, fmax=1000.0):
+    """
+    Estimación grosera de la frecuencia dominante usando el máximo
+    del módulo de la FFT en un rango [fmin, fmax].
+    """
+    dt = t[1] - t[0]
+    n = len(t)
+
+    # FFT real
+    freqs = np.fft.rfftfreq(n, dt)
+    Hf = np.fft.rfft(h)
+
+    mask = (freqs >= fmin) & (freqs <= fmax)
+    if not np.any(mask):
+        raise ValueError("Rango de frecuencias para QNM vacío.")
+
+    freqs_sel = freqs[mask]
+    Hf_sel = np.abs(Hf[mask])
+
+    idx_max = np.argmax(Hf_sel)
+    f_peak = freqs_sel[idx_max]
+    return float(f_peak)
+
+
+def fit_qnm(t_rd, h_rd):
+    """
+    Ajusta el modelo de seno amortiguado a los datos de ringdown.
+    Devuelve parámetros (A, f, tau, phi).
+    """
+    # Estimaciones iniciales
+    A0 = float(np.max(np.abs(h_rd)))
+    f0 = estimate_initial_frequency(t_rd, h_rd)   # Hz
+    tau0 = 0.05                                   # 50 ms: orden razonable
+    phi0 = 0.0
+
+    p0 = [A0, f0, tau0, phi0]
+
+    # Pesos: opcional, aquí simples
+    try:
+        popt, pcov = curve_fit(
+            damped_sinusoid,
+            t_rd,
+            h_rd,
+            p0=p0,
+            maxfev=10000
+        )
+        A_fit, f_fit, tau_fit, phi_fit = popt
+        return A_fit, f_fit, tau_fit, phi_fit, True, "OK"
+    except Exception as e:
+        return A0, f0, tau0, phi0, False, f"Error en ajuste: {e}"
+
+
+# ======================================================
+# 5) Pipeline por evento / detector
+# ======================================================
+
+def analyze_qnm_for_event_detector(event_name: str,
+                                   detector: str,
+                                   t_pre: float = 4.0,
+                                   t_start: float = 0.01,
+                                   t_end: float = 0.30) -> QNMResult:
+    """
+    Pipeline completo:
+    - Carga datos WHITE
+    - Selecciona ringdown
+    - Ajusta seno amortiguado
+    """
+    try:
+        t, h_white, fs = load_white_timeseries(
+            event_name=event_name,
+            detector=detector,
+            t_pre=t_pre
+        )
+    except Exception as e:
+        return QNMResult(
+            event=event_name,
+            detector=detector,
+            f_qnm=np.nan,
+            tau=np.nan,
+            A=np.nan,
+            phi=np.nan,
+            t0=np.nan,
+            success=False,
+            message=f"Error cargando: {e}"
+        )
+
+    try:
+        t_rd, h_rd, t0 = select_ringdown_window(
+            t, h_white,
+            t_start=t_start,
+            t_end=t_end
+        )
+    except Exception as e:
+        return QNMResult(
+            event=event_name,
+            detector=detector,
+            f_qnm=np.nan,
+            tau=np.nan,
+            A=np.nan,
+            phi=np.nan,
+            t0=np.nan,
+            success=False,
+            message=f"Error seleccionando ringdown: {e}"
+        )
+
+    A_fit, f_fit, tau_fit, phi_fit, ok, msg = fit_qnm(t_rd, h_rd)
+
+    return QNMResult(
+        event=event_name,
+        detector=detector,
+        f_qnm=float(f_fit),
+        tau=float(tau_fit),
+        A=float(A_fit),
+        phi=float(phi_fit),
+        t0=float(t0),
+        success=ok,
+        message=msg
+    )
